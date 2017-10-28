@@ -1,2 +1,2 @@
 # proxier-core-net
-A library that provides methods to create proxy types in .net core.
+A library that provides methods to create proxy types in .net core using the System.Reflection, System.Reflection.Emit and System.Linq.Expressions libraries. This is in a very early stage of development so expect the System.Reflection.Emit stuff to be ugly as sin or whatever. Pl0x don't judge me for it. :<
