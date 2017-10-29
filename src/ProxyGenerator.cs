@@ -97,28 +97,31 @@ namespace Proxier.Core
             //If the object has the proxied annotation the class is a valid type for proxying and needs its information generated.
             if (IsProxyable)
             {
+                Dictionary<MethodInfo, IReadOnlyList<Attribute>> methodAttributes = new Dictionary<MethodInfo, IReadOnlyList<Attribute>>();
+                Dictionary<PropertyInfo, IReadOnlyList<Attribute>> propertyAttributes = new Dictionary<PropertyInfo, IReadOnlyList<Attribute>>();
+                MethodInfo[] methods = BaseType.GetMethods();
+                PropertyInfo[] properties = BaseType.GetProperties();
                 //Sets that the class is an observable if the observable attribute is present.
                 IsObservable = Attributes.Any(a => a is ObservableAttribute);
                 //Sets that the class is wrapped if the wrapped attribute is present.
                 IsWrapped = Attributes.Any(a => a is WrappedAttribute);
-                var methodAttributes = new Dictionary<MethodInfo, IReadOnlyList<Attribute>>();
-                var methods = BaseType.GetMethods();
                 //Walks the method definitions of the proxied type. If the method is virtual it is added to the dictionary.
                 foreach (var method in methods)
                 {
+                    IReadOnlyList<Attribute> attributes = method.GetCustomAttributes().ToArray();
                     if (method.IsVirtual && !method.IsSpecialName && method.DeclaringType != typeof(object))
                     {
-                        methodAttributes.Add(method, method.GetCustomAttributes().ToArray());
+                        methodAttributes.Add(method, attributes);
                     }
                     //If the method isn't virtual and there are no observe methods already declared, attempt to find them and
-                    //add them.
-                    else if ((OnChangeCallable == null || OnObserveCallable == null) && !method.IsVirtual)
+                    //add them. Currently the prox generator doesn't support abstract or overloaded methods for observe methods.
+                    else if (!method.IsSpecialName && !method.IsVirtual && (OnChangeCallable == null || OnObserveCallable == null))
                     {
-                        if (OnChangeCallable == null && method.GetCustomAttributes().Any(a => a is OnChangeAttribute))
+                        if (OnChangeCallable == null && attributes.Any(a => a is OnChangeAttribute))
                         {
                             OnChangeCallable = method;
                         }
-                        else if (OnObserveCallable == null && method.GetCustomAttributes().Any(a => a is OnObserveAttribute))
+                        else if (OnObserveCallable == null && attributes.Any(a => a is OnObserveAttribute))
                         {
                             OnObserveCallable = method;
                         }
@@ -126,8 +129,6 @@ namespace Proxier.Core
                 }
                 //Set the property to reference this dictionary.
                 MethodAttributes = methodAttributes;
-                var propertyAttributes = new Dictionary<PropertyInfo, IReadOnlyList<Attribute>>();
-                var properties = BaseType.GetProperties();
                 //Walks the property definitions of the proxied type. If the property has at least 1 virtual accessor
                 //it is added to the dictionary.
                 foreach (var property in properties)
@@ -161,7 +162,7 @@ namespace Proxier.Core
             //Determines if the generator has been generated. If not, create the type and generator.
             if (Generator == null)
             {
-                ConstructorInfo c = GenerateOrGetProxyType().GetConstructor(new Type[0]);
+                ConstructorInfo c = GenerateOrGetProxyType().GetConstructor(Type.EmptyTypes);
                 Generator = Expression.Lambda<Func<T>>(Expression.New(c)).Compile();
             }
             //Call the generator and return the result.
@@ -180,7 +181,7 @@ namespace Proxier.Core
         /// <returns>True if <paramref name="proxyable"/> is not null, <typeparamref name="T"/> is not equal to the proxy
         /// type, and <see cref="Type.IsInstanceOfType(object)"/> returns true, false otherwise.</returns>
         public bool IsProxied(T proxyable) =>
-            proxyable != null && IsProxyable && GenerateOrGetProxyType().IsInstanceOfType(proxyable);
+            IsProxyable && GenerateOrGetProxyType().IsInstanceOfType(proxyable);
 
         private TypeInfo GenerateOrGetProxyType()
         {
@@ -204,7 +205,7 @@ namespace Proxier.Core
         {
             //Creates the dynamic assembly, module and finally the type that will become the proxy type.
             TypeBuilder t = AssemblyBuilder
-                .DefineDynamicAssembly(new AssemblyName($"ProxyAssembly_{ProxyGuid()}"), AssemblyBuilderAccess.Run)
+                .DefineDynamicAssembly(new AssemblyName($"ProxyAssembly_{ProxyGuid()}"), AssemblyBuilderAccess.RunAndCollect)
                 .DefineDynamicModule($"ProxyModule_{ProxyGuid()}")
                 .DefineType($"Proxier.Core.ProxyType_{ProxyGuid()}");
             //Sets the parent of this type to the type provided in the type parameter.
@@ -233,7 +234,6 @@ namespace Proxier.Core
                 bp.Attributes,
                 bp.PropertyType,
                 bp.GetIndexParameters().Select(r => r.ParameterType).ToArray());
-            //Emit code that uses base instead of the wrapped instance field.
             if (bp.CanRead)
             {
                 p.SetGetMethod(GenerateMethod(t, bp.GetMethod, f));
@@ -391,7 +391,7 @@ namespace Proxier.Core
         private void GenerateMethodInjections(ILGenerator g, MethodInfo method, bool isBeforeCall)
         {
             //Walks the attributes of the method and finds any that are proxier annotations.
-            if (MethodAttributes.TryGetValue(method, out var attributes))
+            if (MethodAttributes.TryGetValue(method, out IReadOnlyList<Attribute> attributes))
             {
                 GenerateInjections(g, attributes, isBeforeCall);
             }
@@ -415,6 +415,7 @@ namespace Proxier.Core
         {
             //Loads this onto the stack followed by a string, then calls the method defined in cm.
             g.Emit(OpCodes.Ldarg_0);
+            //TODO: This is gross. Replace it with something that doesn't require replace, or doesn't rely on specific words.
             g.Emit(OpCodes.Ldstr, bm.Name.Replace("get_", "").Replace("set_", ""));
             g.Emit(OpCodes.Call, om);
         }
