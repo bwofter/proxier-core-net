@@ -17,6 +17,7 @@ namespace Proxier.Core
 {
     using Annotations;
     using Annotations.Contracts;
+    using Proxier.Core.Internals;
     using System;
     using System.Collections.Generic;
     using System.Linq;
@@ -78,22 +79,54 @@ namespace Proxier.Core
         /// </summary>
         public bool IsWrapped { get; } = false;
 
-        private Func<T> Generator { get; set; }
         private IReadOnlyList<Attribute> Attributes { get; }
-        private IReadOnlyDictionary<MethodInfo, IReadOnlyList<Attribute>> MethodAttributes { get; }
-        private IReadOnlyDictionary<PropertyInfo, IReadOnlyList<Attribute>> PropertyAttributes { get; }
         private TypeInfo BaseType { get; } = typeof(T).GetTypeInfo();
-        private TypeInfo ProxyType { get; set; }
+        private Lazy<Func<T, T>> Extractor { get; }
+        private Lazy<Func<T>> Generator { get; }
+        private IReadOnlyDictionary<MethodInfo, IReadOnlyList<Attribute>> MethodAttributes { get; }
         private MethodInfo OnChangeCallable { get; set; }
         private MethodInfo OnObserveCallable { get; set; }
+        private IReadOnlyDictionary<PropertyInfo, IReadOnlyList<Attribute>> PropertyAttributes { get; }
+        private TypeInfo ProxyType { get; set; }
+        private string ProxyTypeName =>
+            GenerateOrGetProxyType().FullName;
 
-        private static ProxyGenerator<T> Singleton { get; }
+        private static Lazy<ProxyGenerator<T>> Singleton { get; } =
+            new Lazy<ProxyGenerator<T>>(() => new ProxyGenerator<T>(), true);
 
+        static ProxyGenerator() { }
         private ProxyGenerator()
         {
             //Listify this class's attributes and determine whether or not a proxied annotation has been attached to the class.
             Attributes = BaseType.GetCustomAttributes().ToList();
             IsProxyable = Attributes.Any(a => a is ProxiedAttribute) && !BaseType.IsSealed;
+            //Initialize the lazy loaders for the generator and extractor and mark them for thread safety.
+            Generator = new Lazy<Func<T>>(() =>
+            {
+                //Get the constructor from the proxy type, then generate the new expression and compile it to a lambda.
+                ConstructorInfo c = GenerateOrGetProxyType().GetConstructor(Type.EmptyTypes);
+                return Expression.Lambda<Func<T>>(Expression.New(c)).Compile();
+            }, true);
+            Extractor = new Lazy<Func<T, T>>(() =>
+            {
+                //Initializes a parameter expression of the type T, then convert it to the generic type. We do this to so that
+                //the lambda is strictly typed and we don't need to call the dynamic invoke method.
+                ParameterExpression p = Expression.Parameter(typeof(T));
+                Expression<Func<T, T>> fu = null;
+                if (IsWrapped)
+                {
+                    FieldInfo m = GenerateOrGetProxyType().GetField(ProxyWrappedName(GenerateOrGetProxyType()), BindingFlags.NonPublic | BindingFlags.Instance);
+                    BinaryExpression t = Expression.Assign(p, Expression.MakeMemberAccess(Expression.Convert(p, GenerateOrGetProxyType()), m));
+                    BinaryExpression f = Expression.Assign(p, p);
+                    ConditionalExpression co = Expression.IfThenElse(Expression.TypeIs(p, GenerateOrGetProxyType()), t, f);
+                    fu = Expression.Lambda<Func<T, T>>(Expression.Block(co, p), p);
+                }
+                else
+                {
+                    fu = Expression.Lambda<Func<T, T>>(p, p);
+                }
+                return fu.Compile();
+            });
             //If the object has the proxied annotation the class is a valid type for proxying and needs its information generated.
             if (IsProxyable)
             {
@@ -144,30 +177,20 @@ namespace Proxier.Core
             }
         }
 
-        static ProxyGenerator() =>
-            Singleton = new ProxyGenerator<T>();
-
         /// <summary>
         /// <para>
         /// Description:
         /// </para>
         /// <para>
-        /// Gets a new instance of the proxy type for <typeparamref name="T"/>. If <typeparamref name="T"/> is not marked with
-        /// <see cref="ProxiedAttribute"/> then an instance of <typeparamref name="T"/> is returned instead.
+        /// Gets the base instance of a wrapped type. This will return the value of <paramref name="extractable"/> if
+        /// <see cref="IsWrapped"/> is false or <see cref="IsProxied(T)"/> returns false.
         /// </para>
         /// </summary>
-        /// <returns>A new instance of <typeparamref name="T"/>.</returns>
-        public T New()
-        {
-            //Determines if the generator has been generated. If not, create the type and generator.
-            if (Generator == null)
-            {
-                ConstructorInfo c = GenerateOrGetProxyType().GetConstructor(Type.EmptyTypes);
-                Generator = Expression.Lambda<Func<T>>(Expression.New(c)).Compile();
-            }
-            //Call the generator and return the result.
-            return Generator();
-        }
+        /// <param name="extractable">A wrapped <see cref="T"/> instance.</param>
+        /// <returns>Either the wrapped <see cref="T"/> instance if <see cref="IsWrapped"/> is true and <see cref="IsProxied(T)"/>
+        /// returns true, the value of <paramref name="extractable"/> otherwise.</returns>
+        public T Extract(T extractable) =>
+            IsWrapped && IsProxied(extractable) ? Extractor.Value(extractable) : extractable;
         /// <summary>
         /// <para>
         /// Description:
@@ -182,73 +205,49 @@ namespace Proxier.Core
         /// type, and <see cref="Type.IsInstanceOfType(object)"/> returns true, false otherwise.</returns>
         public bool IsProxied(T proxyable) =>
             IsProxyable && GenerateOrGetProxyType().IsInstanceOfType(proxyable);
+        /// <summary>
+        /// <para>
+        /// Description:
+        /// </para>
+        /// <para>
+        /// Gets a new instance of the proxy type for <typeparamref name="T"/>. If <typeparamref name="T"/> is not marked with
+        /// <see cref="ProxiedAttribute"/> then an instance of <typeparamref name="T"/> is returned instead.
+        /// </para>
+        /// </summary>
+        /// <returns>A new instance of <typeparamref name="T"/>.</returns>
+        public T New() =>
+            Generator.Value();
 
-        private TypeInfo GenerateOrGetProxyType()
+        private void GenerateInjection(int i, ILGenerator g, ProxierAnnotationAttribute a)
         {
-            //Determines if the proxied type has been generated. If not, determine if the type is proxyable.
-            //If it is, create the proxy type. Otherwise, set the proxy type to base type for errorless operation.
-            if (ProxyType == null)
+            //Determines if the attribute is a parameter assertion and, if so, sets the parameter index.
+            if (a is IParameterAttribute ia)
             {
-                if (IsProxyable)
-                {
-                    ProxyType = CreateProxyType();
-                }
-                else
-                {
-                    ProxyType = BaseType;
-                }
+                ia.Index = i + 1;
             }
-            //Return the proxy type.s
-            return ProxyType;
+            //Calls the injector of the annotation to inject in the code needed.
+            a.Inject(g);
         }
-        private TypeInfo CreateProxyType()
+        private void GenerateInjections(ILGenerator g, IReadOnlyList<Attribute> attributes, bool isBeforeCall)
         {
-            //Creates the dynamic assembly, module and finally the type that will become the proxy type.
-            TypeBuilder t = AssemblyBuilder
-                .DefineDynamicAssembly(new AssemblyName($"ProxyAssembly_{ProxyGuid()}"), AssemblyBuilderAccess.RunAndCollect)
-                .DefineDynamicModule($"ProxyModule_{ProxyGuid()}")
-                .DefineType($"Proxier.Core.ProxyType_{ProxyGuid()}");
-            //Sets the parent of this type to the type provided in the type parameter.
-            t.SetParent(BaseType);
-            FieldBuilder f = null;
-            if (IsWrapped)
+            //Walks the attributes provided and, if they are a proxier annotation attribute, calls their injection method.
+            foreach (Attribute a in attributes)
             {
-                f = GenerateWrappedConstructor(t);
+                if (a is ProxierAnnotationAttribute p)
+                {
+                    //Determines if the proxier annotation attribute's is before call bool that is equal to the is before call
+                    //parameter and, if so, injects the IL.
+                    if (p.IsBeforeCall == isBeforeCall)
+                    {
+                        p.Inject(g);
+                    }
+                }
             }
-            //Walks all of the methods that have been defined and generates their overrides.
-            foreach (var methodDetails in MethodAttributes.Keys)
-            {
-                GenerateMethod(t, methodDetails, f);
-            }
-            //Walks all of the properties that have been defined and generates their overrides.
-            foreach (var propertyDetails in PropertyAttributes.Keys)
-            {
-                GenerateProperty(t, propertyDetails, f);
-            }
-            return t.CreateTypeInfo();
-        }
-        private PropertyBuilder GenerateProperty(TypeBuilder t, PropertyInfo bp, FieldBuilder f)
-        {
-            //Defines the dynamic property based directly off of the base property.
-            PropertyBuilder p = t.DefineProperty(bp.Name,
-                bp.Attributes,
-                bp.PropertyType,
-                bp.GetIndexParameters().Select(r => r.ParameterType).ToArray());
-            if (bp.CanRead)
-            {
-                p.SetGetMethod(GenerateMethod(t, bp.GetMethod, f));
-            }
-            if (bp.CanWrite)
-            {
-                p.SetSetMethod(GenerateMethod(t, bp.SetMethod, f));
-            }
-            //Returns the property builder. This is not currently used.
-            return p;
         }
         private MethodBuilder GenerateMethod(TypeBuilder t, MethodInfo bm, FieldBuilder f, IReadOnlyList<Attribute> attributes = null)
         {
             //Defines the dynamic method based directly off of the base method, then gets its parameters and return info.
-            MethodBuilder m = t.DefineMethod(bm.Name, bm.Attributes);
+            MethodBuilder m = t.DefineMethod(bm.Name, bm.Attributes & ~System.Reflection.MethodAttributes.NewSlot);
             IReadOnlyList<ParameterInfo> parameters = bm.GetParameters().ToArray();
             ParameterInfo rParameter = bm.ReturnParameter;
             //Sets the parameters and return type to the types expected by the parent and defines the dynamic method as a direct
@@ -339,37 +338,49 @@ namespace Proxier.Core
             //Returns the method builder. This is not currently used.
             return m;
         }
-        private void GenerateInjection(int i, ILGenerator g, ProxierAnnotationAttribute a)
+        private void GenerateMethodInjections(ILGenerator g, MethodInfo method, bool isBeforeCall)
         {
-            //Determines if the attribute is a parameter assertion and, if so, sets the parameter index.
-            if (a is IParameterAttribute ia)
+            //Attempts to get the attributes of the method out of the method attributes dictionary. If successful,
+            //call the generate injections method.
+            if (MethodAttributes.TryGetValue(method, out IReadOnlyList<Attribute> attributes))
             {
-                ia.Index = i + 1;
+                GenerateInjections(g, attributes, isBeforeCall);
             }
-            //Calls the injector of the annotation to inject in the code needed.
-            a.Inject(g);
         }
-        private FieldBuilder GenerateWrappedConstructor(TypeBuilder t)
+        private void GenerateObserveInjection(ILGenerator g, MethodInfo bm, MethodInfo om)
         {
-            //Defines a string to contain the name of the wrapped instance field, then assign this value to a randomly generated proxy field that
-            //is read only.
-            FieldBuilder f = t.DefineField($"_wrappedInstance_{ProxyGuid()}", BaseType, FieldAttributes.Private | FieldAttributes.InitOnly);
-            //Defines the parameterless constructor and gets its generator.
-            ConstructorBuilder c = t.DefineConstructor(System.Reflection.MethodAttributes.Public, CallingConventions.HasThis, Type.EmptyTypes);
-            ILGenerator g = c.GetILGenerator();
-            //Defines a local of the base type, emits IL that calls the constructor of the base type, and finally loads the instance into the loc.
-            LocalBuilder l = g.DeclareLocal(BaseType);
-            g.Emit(OpCodes.Newobj, BaseType.GetConstructor(Type.EmptyTypes));
-            g.Emit(OpCodes.Stloc, l);
-            //Loads this and the local, then emits the set field IL pointing to the wrapped instance field.
+            //Loads this onto the stack followed by a string, then calls the method defined in cm.
             g.Emit(OpCodes.Ldarg_0);
-            g.Emit(OpCodes.Ldloc, l);
-            g.Emit(OpCodes.Stfld, f);
-            //Emits IL to safely exit the constructor call.
-            g.Emit(OpCodes.Nop);
-            g.Emit(OpCodes.Ret);
-            //Return the wrapped instance field name. This is used to get the field later on during generation.
-            return f;
+            //Determines if the observation is happening on an accessor and, if so, removes the access components from the name. Otherwise,
+            //use the base method's name for the observable call.
+            if (bm.IsSpecialName)
+            {
+                g.Emit(OpCodes.Ldstr, RemoveAccessorComponents(bm.Name));
+            }
+            else
+            {
+                g.Emit(OpCodes.Ldstr, bm.Name);
+            }
+            //Injects IL to call the observe method. Currently the observe method must have a single string parameter.
+            g.Emit(OpCodes.Call, om);
+        }
+        private TypeInfo GenerateOrGetProxyType()
+        {
+            //Determines if the proxied type has been generated. If not, determine if the type is proxyable.
+            //If it is, create the proxy type. Otherwise, set the proxy type to base type for errorless operation.
+            if (ProxyType == null)
+            {
+                if (IsProxyable)
+                {
+                    ProxyType = CreateProxyType();
+                }
+                else
+                {
+                    ProxyType = BaseType;
+                }
+            }
+            //Return the proxy type.s
+            return ProxyType;
         }
         private void GenerateParameterInjections(ILGenerator g, IReadOnlyList<ParameterInfo> parameters)
         {
@@ -388,37 +399,110 @@ namespace Proxier.Core
                 }
             }
         }
-        private void GenerateMethodInjections(ILGenerator g, MethodInfo method, bool isBeforeCall)
+        private PropertyBuilder GenerateProperty(TypeBuilder t, PropertyInfo bp, FieldBuilder f)
         {
-            //Walks the attributes of the method and finds any that are proxier annotations.
-            if (MethodAttributes.TryGetValue(method, out IReadOnlyList<Attribute> attributes))
+            //Defines the dynamic property based directly off of the base property.
+            PropertyBuilder p = t.DefineProperty(bp.Name,
+                bp.Attributes,
+                bp.PropertyType,
+                bp.GetIndexParameters().Select(r => r.ParameterType).ToArray());
+            if (bp.CanRead)
             {
-                GenerateInjections(g, attributes, isBeforeCall);
+                p.SetGetMethod(GenerateMethod(t, bp.GetMethod, f, PropertyAttributes[bp]));
             }
-        }
-        private void GenerateInjections(ILGenerator g, IReadOnlyList<Attribute> attributes, bool isBeforeCall)
-        {
-            foreach (Attribute a in attributes)
+            if (bp.CanWrite)
             {
-                if (a is ProxierAnnotationAttribute p)
-                {
-                    //Determines if the proxier annotation attribute's is before call bool that is equal to the is before call
-                    //parameter and, if so, injects the IL.
-                    if (p.IsBeforeCall == isBeforeCall)
-                    {
-                        p.Inject(g);
-                    }
-                }
+                p.SetSetMethod(GenerateMethod(t, bp.SetMethod, f, PropertyAttributes[bp]));
             }
+            //Returns the property builder. This is not currently used.
+            return p;
         }
-        private void GenerateObserveInjection(ILGenerator g, MethodInfo bm, MethodInfo om)
+        private TypeInfo CreateProxyType()
         {
-            //Loads this onto the stack followed by a string, then calls the method defined in cm.
+            TypeBuilder t = ProxyGeneratorCache.Module.DefineType(NewProxyTypeName());
+            //Sets the parent of this type to the type provided in the type parameter.
+            t.SetParent(BaseType);
+            FieldBuilder f = null;
+            if (IsWrapped)
+            {
+                f = GenerateWrappedConstructor(t);
+                GenerateWrappedOverride(nameof(GetHashCode), t, f);
+                GenerateWrappedOverride(nameof(Equals), t, f);
+            }
+            //Walks all of the methods that have been defined and generates their overrides.
+            foreach (var methodDetails in MethodAttributes.Keys)
+            {
+                GenerateMethod(t, methodDetails, f);
+            }
+            //Walks all of the properties that have been defined and generates their overrides.
+            foreach (var propertyDetails in PropertyAttributes.Keys)
+            {
+                GenerateProperty(t, propertyDetails, f);
+            }
+            return t.CreateTypeInfo();
+        }
+        private FieldBuilder GenerateWrappedConstructor(TypeBuilder t)
+        {
+            //Defines a string to contain the name of the wrapped instance field, then assign this value to a randomly generated proxy field that
+            //is read only.
+            FieldBuilder f = t.DefineField(ProxyWrappedName(t), BaseType, FieldAttributes.FamORAssem | FieldAttributes.InitOnly);
+            //Defines the parameterless constructor and gets its generator.
+            ConstructorBuilder c = t.DefineConstructor(System.Reflection.MethodAttributes.Public, CallingConventions.HasThis, Type.EmptyTypes);
+            ILGenerator g = c.GetILGenerator();
+            //Defines a local of the base type, emits IL that calls the constructor of the base type, and finally loads the instance into the loc.
+            LocalBuilder l = g.DeclareLocal(BaseType);
+            g.Emit(OpCodes.Newobj, BaseType.GetConstructor(Type.EmptyTypes));
+            g.Emit(OpCodes.Stloc, l);
+            //Loads this and the local, then emits the set field IL pointing to the wrapped instance field.
             g.Emit(OpCodes.Ldarg_0);
-            //TODO: This is gross. Replace it with something that doesn't require replace, or doesn't rely on specific words.
-            g.Emit(OpCodes.Ldstr, bm.Name.Replace("get_", "").Replace("set_", ""));
-            g.Emit(OpCodes.Call, om);
+            g.Emit(OpCodes.Ldloc, l);
+            g.Emit(OpCodes.Stfld, f);
+            //Emits IL to safely exit the constructor call.
+            g.Emit(OpCodes.Nop);
+            g.Emit(OpCodes.Ret);
+            //Return the wrapped instance field name. This is used to get the field later on during generation.
+            return f;
         }
+        private void GenerateWrappedOverride(string name, TypeBuilder t, FieldBuilder f) =>
+            //Gets the method by the name provided. This method is generally unsafe if a method has overloads, but for basic built in methods
+            //such as get hash code or equals, this should be safe enough.
+            GenerateWrappedOverride(typeof(T).GetMethod(name), t, f);
+        private void GenerateWrappedOverride(string name, Type[] types, TypeBuilder t, FieldBuilder f) =>
+            //Gets the method by the name and parameter types provided. This method should be preferred over name only resolution due to it
+            //not producing errors when a method has overloads.
+            GenerateWrappedOverride(typeof(T).GetMethod(name, types), t, f);
+        private void GenerateWrappedOverride(MethodInfo bm, TypeBuilder t, FieldBuilder f)
+        {
+            //If the method is found and is virtual, generate the override. Otherwise, we can't generate an override and we need to ignore
+            //the call.
+            if (bm != null && bm.IsVirtual)
+            {
+                //Defines a new method using the values of bm. Remove new slot to prevent issues arising later on that might cause the base
+                //method to be called in some contexts instead of the override. Then, set the parameters and return types.
+                MethodBuilder m = t.DefineMethod(bm.Name, bm.Attributes & ~System.Reflection.MethodAttributes.NewSlot);
+                m.SetParameters(bm.GetParameters().Select(p => p.ParameterType).ToArray());
+                m.SetReturnType(bm.ReturnType);
+                //Add the override to the type and get the method IL generator.
+                t.DefineMethodOverride(m, bm);
+                ILGenerator g = m.GetILGenerator();
+                //Load this onto the stack, then load the field from this onto the stack.
+                g.Emit(OpCodes.Ldarg_0);
+                g.Emit(OpCodes.Ldfld, f);
+                //Load all parameters onto the stack by index.
+                for (int i = 0; i < bm.GetParameters().Count(); i++)
+                {
+                    g.Emit(OpCodes.Ldarg_S, i + 1);
+                }
+                //Inject IL to call the base method on the field, then return the result if one is returned. If no return type is cleared,
+                //force a nop onto the stack to prevent errors being generated when return is hit.
+                g.Emit(OpCodes.Callvirt, bm);
+                if (m.ReturnType == typeof(void))
+                    g.Emit(OpCodes.Nop);
+                g.Emit(OpCodes.Ret);
+            }
+        }
+        private string ProxyWrappedName(Type t) =>
+            $"_wrappedInstance_{t.FullName.Replace('.', '_')}";
 
         /// <summary>
         /// <para>
@@ -431,10 +515,11 @@ namespace Proxier.Core
         /// </summary>
         /// <returns>A <see cref="ProxyGenerator{T}"/> for <typeparamref name="T"/>.</returns>
         public static ProxyGenerator<T> GetInstance() =>
-            Singleton;
+            Singleton.Value;
 
-        private static string ProxyGuid() =>
-            //Creates a guid, converts it to a string and replaces any - with _.
-            Guid.NewGuid().ToString().Replace('-', '_');
+        private static string NewProxyTypeName() =>
+            $"Proxier.Core.ProxyType_{ProxyGeneratorCache.ProxyGuid()}";
+        private static string RemoveAccessorComponents(string accessorName) =>
+            accessorName.Split(new[] { '_' }, 2).Last();
     }
 }

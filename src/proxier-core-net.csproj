@@ -5,4 +5,9 @@
     <RootNamespace>Proxier.Core</RootNamespace>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <DocumentationFile>bin\Release\netcoreapp2.0\proxier-core-net.xml</DocumentationFile>
+  </PropertyGroup>
+
 </Project>
